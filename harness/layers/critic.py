@@ -78,17 +78,66 @@ class Critic(Middleware):
 
     name = "critic"
 
+    def _doc_for_line(self, ctx, text: str) -> str | None:
+        """Tài liệu nào chứa `text` nguyên văn trên một DÒNG?"""
+        for doc in ctx.corpus.docs:
+            if any(text in line for line in doc.body.splitlines()):
+                return doc.doc_id
+        return None
+
+    def _split_fused(self, ctx, text: str) -> list[dict] | None:
+        """Thử tách một câu ghép từ hai tài liệu mâu thuẫn, dán bằng ' và '."""
+        parts = text.split(" và ")
+        for i in range(1, len(parts)):
+            left = " và ".join(parts[:i]).strip()
+            right = " và ".join(parts[i:]).strip()
+            if not left or not right:
+                continue
+            if not (ctx.saw(left) and ctx.saw(right)):
+                continue
+            left_doc = self._doc_for_line(ctx, left)
+            right_doc = self._doc_for_line(ctx, right)
+            if left_doc and right_doc and left_doc != right_doc:
+                return [
+                    {"text": left, "doc_id": left_doc},
+                    {"text": right, "doc_id": right_doc},
+                ]
+        return None
+
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims:
+            return report
+
+        kept: list[dict] = []
+        fused_any = False
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text")
+            if not isinstance(text, str) or not text:
+                continue
+            if ctx.saw(text):
+                kept.append(claim)
+                continue
+            split = self._split_fused(ctx, text)
+            if split is not None:
+                kept.extend(split)
+                fused_any = True
+            # không tách được -> bịa, bỏ claim
+
+        if fused_any:
+            report["abstain"] = True
+
+        if not kept:
+            report["abstain"] = True
+            report["claims"] = []
+            report["citations"] = []
+            report["answer"] = "Không đủ căn cứ trong tài liệu để trả lời chắc chắn."
+            return report
+
+        report["claims"] = kept
+        report["citations"] = sorted(
+            {c["doc_id"] for c in kept if c.get("doc_id")}
+        )
+        return report
